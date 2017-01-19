@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.4.0)
+project (libkcp)
+include_directories(.)
+set(SOURCES ikcp.c)
+add_library(libkcp STATIC ${SOURCES})
