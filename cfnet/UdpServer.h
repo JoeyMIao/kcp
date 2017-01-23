@@ -20,6 +20,7 @@
 
 #include "event.h"
 
+//TODO:KCP v1协议的实现
 namespace cf
 {
     class UdpServer
@@ -37,10 +38,14 @@ namespace cf
             sockaddr_in addr;
         };
 
-        UdpServer(const std::string &ip, const uint16_t port, uint32_t guessSize) :
-                _started(false), _ip(ip), _port(port), _base(event_base_new()), _listenSocket(0),
-                curInUseBuf(nullptr), curBuffIndex(0),extraMallocBuffCount(0),
-                _readMsgQueue(guessSize), _bufferQueue(PrelocatedBuffBlockCount * 10)
+        UdpServer(const std::string &ip, const uint16_t port, uint32_t guessSize, uint32_t mtu = 1500,
+                  uint32_t prelocatedBuffBlockSize = 1024 * 1000,
+                  uint32_t prelocatedBuffBlockCount = 20) :
+                _inited(false), _started(false), _running(false), _ip(ip), _port(port), _base(nullptr),
+                _listenSocket(0), mtu(mtu), prelocatedBuffBlockSize(prelocatedBuffBlockSize),
+                prelocatedBuffBlockCount(prelocatedBuffBlockCount),
+                curInUseBuf(nullptr), curBuffIndex(0), extraMallocBuffCount(0),
+                _readMsgQueue(guessSize), _bufferQueue(prelocatedBuffBlockCount * 10)
         {
 
         }
@@ -54,9 +59,10 @@ namespace cf
                 evutil_closesocket(_listenSocket);
         }
 
-        bool start()
+        bool init()
         {
-            if(!initBuffer())
+            assert(!_inited);
+            if (!initBuffer())
                 return false;
             _listenSocket = socket(AF_INET, SOCK_DGRAM, 0);
             assert(_listenSocket > 0);
@@ -71,44 +77,76 @@ namespace cf
             sin.sin_port = htons(_port);
             if (bind(_listenSocket, (const struct sockaddr *) &sin, sizeof(sin)) != 0)
             {
-                LOG(INFO) << "Bind Error !";
+                LOG(ERROR) << "Bind Error !";
                 return false;
             }
+            _base = event_base_new();
+            assert(_base != nullptr);
+            if (!_base)
+            {
+                LOG(ERROR) << "event_base_new error !";
+                return false;
+            }
+            _inited = true;
+            return true;
+        }
 
+        void start()
+        {
+            assert(!_started && _inited);
             event *listenEvent = event_new(_base, _listenSocket, EV_READ | EV_PERSIST, eventCallback, this);
             event_add(listenEvent, NULL);
-            event_base_dispatch(_base);
             LOG(INFO) << "Server started";
             _started = true;
-            return true;
+            _running = true;
+            while (_running)
+            {
+                struct timeval timeout;
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 1000 * 50;
+                event_base_loopexit(_base, &timeout);
+                event_base_loop(_base, 0);
+            }
+            event_free(listenEvent);
+            event_base_free(_base);
+            _base = nullptr;
+            LOG(INFO) << "udp server closed";
+        }
+
+        void shutdown()
+        {
+            _running = false;
         }
 
         ssize_t sendMessageTo(const sockaddr_in &addr, const char *buff, int32_t size)
         {
+            assert(_inited);
+            if (!_inited)
+                return 0;
             return sendto(_listenSocket, buff, (size_t) size, 0, (struct sockaddr *) &addr,
                           (socklen_t) sizeof(sockaddr_in));
         }
 
-        bool tryPopValue(Message& msg)
+        bool tryPopValue(Message &msg)
         {
             return _readMsgQueue.read(msg);
         }
 
-        bool returnBuff(char* buf)
+        bool returnBuff(char *buf)
         {
             bool result = _bufferQueue.write(buf);
-            if(!result)
+            if (!result)
             {
-                LOG(FATAL)<<"buffer return to udpserver failed";
+                LOG(FATAL) << "buffer return to udpserver failed";
             }
             return result;
         }
 
         const static socklen_t AddrLen = sizeof(struct sockaddr_in);
-        const static size_t MAXMTU = 1500;
-        const static int32_t PrelocatedBuffBlockSize = 1024 * 1000;
-        const static int32_t PrelocatedBuffBlockCount = 20;
 
+        const uint32_t mtu;
+        const uint32_t prelocatedBuffBlockSize;
+        const uint32_t prelocatedBuffBlockCount;
     private:
         static void eventCallback(evutil_socket_t sock, short evFlags, void *serverPtr)
         {
@@ -119,7 +157,7 @@ namespace cf
                 socklen_t len = AddrLen;
                 Message mess;
                 //TODO: try to recv until an EINTER happen
-                ssize_t size = recvfrom(sock, server->curInUseBuf, MAXMTU, 0, (struct sockaddr *) &mess.addr,
+                ssize_t size = recvfrom(sock, server->curInUseBuf, server->mtu, 0, (struct sockaddr *) &mess.addr,
                                         &len);
                 if (size == -1)
                 {
@@ -131,20 +169,20 @@ namespace cf
                                   << ":"
                                   << mess.addr.sin_port;
                     }
-                }
-                else
+                } else
                 {
+                    /*
                     LOG(INFO) << "read from " << inet_ntoa(mess.addr.sin_addr) << ":"
                               << ::ntohs(mess.addr.sin_port)
                               << "," << std::string(server->curInUseBuf, (unsigned long) size);
-
+                    */
                     mess.buffSize = (uint16_t) size;
                     mess.buff = server->curInUseBuf;
                     server->curBuffIndex += size;
                     //TODO:if no msgQueue is full, then stop reciving message
-                    if(!server->_readMsgQueue.write(mess))
+                    if (!server->_readMsgQueue.write(mess))
                     {
-                        LOG(FATAL) <<"read msg queue is full,discard msg";
+                        LOG(FATAL) << "read msg queue is full,discard msg";
                     }
                 }
 
@@ -156,23 +194,22 @@ namespace cf
 
         inline void checkReadBuffer()
         {
-            if(PrelocatedBuffBlockSize - curBuffIndex < MAXMTU)
+            if (prelocatedBuffBlockSize - curBuffIndex < mtu)
             {
-                char* newBuff;
+                char *newBuff;
                 bool result = _bufferQueue.read(newBuff);
-                if(result)
+                if (result)
                 {
                     curInUseBuf = newBuff;
                     curBuffIndex = 0;
-                }
-                else
+                } else
                 {
                     //TODO:if no left buffer,try allocate a mtu buffer one time, avoid OOM
-                    newBuff = (char*)malloc(PrelocatedBuffBlockSize);
-                    if(!newBuff)
+                    newBuff = (char *) malloc(prelocatedBuffBlockSize);
+                    if (!newBuff)
                     {
                         LOG(FATAL) << "allocate new buff failed ";
-                        assert(newBuff!=nullptr);
+                        assert(newBuff != nullptr);
                         curInUseBuf = newBuff;
                         curBuffIndex = 0;
                     }
@@ -184,30 +221,34 @@ namespace cf
         bool initBuffer()
         {
             //prelocate 20M memory for buffer
-            for (int j = 0; j < PrelocatedBuffBlockCount; ++j)
+            for (int j = 0; j < prelocatedBuffBlockCount; ++j)
             {
-                void *buffer = malloc(PrelocatedBuffBlockSize);
-                if(!buffer)
+                void *buffer = malloc(prelocatedBuffBlockSize);
+                if (!buffer)
                 {
                     assert(buffer != nullptr);
                     return false;
                 }
                 _bufferQueue.write((char *) buffer);
             }
-            if(!_bufferQueue.read(curInUseBuf))
+            if (!_bufferQueue.read(curInUseBuf))
             {
-                LOG(FATAL)<<"init buff error";
+                LOG(FATAL) << "init buff error";
                 assert(true);
                 return false;
             }
             return true;
         }
 
+        bool _inited;
         bool _started;
+        bool _running;
         const std::string _ip;
         const uint16_t _port;
-        event_base *const _base;
+        event_base *_base;
         evutil_socket_t _listenSocket;
+
+
         char *curInUseBuf;
         uint32_t curBuffIndex;
         uint32_t extraMallocBuffCount;

@@ -3,7 +3,8 @@
 //
 
 #include <stdio.h>
-#include "KcpServer.h"
+#include "cfnet/KcpServer.h"
+#include "CFUtil.h"
 
 int main(int argc, char* argv[])
 {
@@ -14,6 +15,10 @@ int main(int argc, char* argv[])
 
     cf::KcpServer kcpServer;
     kcpServer.start("127.0.0.1", 13333, 5000);
-
+    while(true)
+    {
+        kcpServer.update(cf::CFUtil::iclock());
+        usleep(1000);
+    }
     return 0;
 }

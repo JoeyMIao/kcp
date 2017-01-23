@@ -31,6 +31,7 @@ namespace cf
 {
     class CFUtil
     {
+    public:
         /* get system time */
         static inline void itimeofday(long *sec, long *usec)
         {

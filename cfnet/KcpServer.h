@@ -14,64 +14,61 @@ namespace cf
     class KcpServer
     {
     public:
-        KcpServer() : _started(false), _curSessionSeq(0), _curUdpBuffIndex(0), _udpServer(nullptr) {}
+        KcpServer() : _started(false),_running(false), _curSessionSeq(0), _curUdpBuffIndex(0), _udpServer(nullptr) {}
 
         bool start(const std::string &ip, const uint16_t port, uint32_t guessSize)
         {
             assert(!_started);
             _udpServer = new UdpServer(ip, port, guessSize);
             assert(_udpServer);
-            _started = _udpServer->start();
-            return _started;
+            if(!_udpServer->init())
+                return false;
+            _udpThread = std::thread([&] { _udpServer->start();});
+            _started = true;
+            _running = true;
+            return true;
+        }
+
+        void shutdown()
+        {
+            _udpServer->shutdown();
+            _udpThread.join();
+            for(auto iter = _idSessionMap.begin();iter!=_idSessionMap.end();++iter)
+            {
+                assert(iter->second);
+                delete iter->second;
+            }
+            _idSessionMap.clear();
+            _addrSessionMap.clear();
         }
 
         void update(uint32_t curTick)
         {
-            if (!_started)
+            if (!_started ||!_running)
                 return;
 
             UdpServer::Message mess;
             while (_udpServer->tryPopValue(mess))
             {
-                int willReturnBuff =false;
-                if(mess.buffSize+_curUdpBuffIndex >= UdpServer::PrelocatedBuffBlockSize)
-                {
-                    willReturnBuff = true;
-                }
-
                 auto msgSessionIter = _addrSessionMap.find(mess.addr);
                 if (msgSessionIter != _addrSessionMap.end())
                 {
-                    ikcp_input(msgSessionIter->second->kcp, mess.buff, mess.buffSize);
-                    while (true)
-                    {
-                        int gotSize = ikcp_recv(msgSessionIter->second->kcp, _buff, BuffSize);
-                        if (gotSize <= 0)
-                            break;
-                        LOG(INFO) << "recv:" << std::string(_buff, gotSize);
-                    }
-                } else
-                {
-                    LOG(INFO) << "OnConnected:" << _curSessionSeq + 1;
-                    Session *session = new Session(++_curSessionSeq, mess.addr);
-                    assert(session != nullptr);
-                    session->kcp = ikcp_create(_curSessionSeq, (void *) this);
-                    assert(session->kcp != nullptr);
-                    session->kcp->output = udpOutput;
-                    _addrSessionMap.insert(std::make_pair(mess.addr, session));
-                    _idSessionMap.insert(std::make_pair(_curSessionSeq, session));
-                }
-
-                if(willReturnBuff)
-                {
-                    //TODO:错误处理
-                    _udpServer->returnBuff(mess.buff);
-                    _curUdpBuffIndex = 0;
+                    handleRawMessage(mess, msgSessionIter->second->kcp);
                 }
                 else
                 {
-                    _curUdpBuffIndex += mess.buffSize;
+                    if(validNewConnectionMsg(mess))
+                    {
+                        LOG(INFO) << "OnConnected:" << _curSessionSeq + 1;
+                        processNewConnection(mess);
+                    }
+                    else
+                    {
+                        LOG(INFO)<<"recv unconnected msg size:"<< mess.buffSize;
+                    }
                 }
+
+                recycleBuffToUdpServer(mess);
             }
 
             auto iterBegin = _idSessionMap.begin();
@@ -95,11 +92,7 @@ namespace cf
             ssize_t ret = _udpServer->sendMessageTo(iter->second->sockAddr, buff, size);
 
             //TODO:needs an onDisconnect callback
-            if (ret < 0)
-            {
-                return false;
-            }
-            return true;
+            return ret >= 0;
 
         }
 
@@ -108,11 +101,7 @@ namespace cf
             ssize_t ret = _udpServer->sendMessageTo(addr, buff, size);
 
             //TODO:needs an onDisconnect callback
-            if (ret < 0)
-            {
-                return false;
-            }
-            return true;
+            return ret >= 0;
         }
 
         uint32_t removeSessionIfExsitsByAddr(const sockaddr_in &addr)
@@ -140,11 +129,66 @@ namespace cf
 
 
     private:
+
         static int udpOutput(const char *buf, int len, ikcpcb *kcp, void *user)
         {
             KcpServer *kcpServer = static_cast<KcpServer *>(user);
             kcpServer->sendtoBySessionID(kcp->conv, buf, len);
             return 0;
+        }
+
+        void handleRawMessage(const UdpServer::Message& mess, ikcpcb *kcp)
+        {
+            ikcp_input(kcp, mess.buff, mess.buffSize);
+            while (true)
+            {
+                int gotSize = ikcp_recv(kcp, _buff, BuffSize);
+                if (gotSize <= 0)
+                    break;
+                LOG(INFO) << "recv:" << std::string(_buff, (unsigned long) gotSize);
+                ikcp_send(kcp, _buff, gotSize);
+            }
+        }
+
+        bool validNewConnectionMsg(const UdpServer::Message& mess) const
+        {
+            if(mess.buffSize==4)
+            {
+                uint32_t magicCode;
+                memcpy(&magicCode, mess.buff, 4);
+                if (magicCode == 100319)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void processNewConnection(const UdpServer::Message& mess)
+        {
+            Session *session = new Session(++_curSessionSeq, mess.addr);
+            assert(session);
+            session->kcp = ikcp_create((IUINT32) _curSessionSeq, (void *) this);
+            assert(session->kcp);
+            session->kcp->output = udpOutput;
+            _addrSessionMap.insert(std::make_pair(mess.addr, session));
+            _idSessionMap.insert(std::make_pair(_curSessionSeq, session));
+            memcpy(mess.buff, &_curSessionSeq,  4);
+            _udpServer->sendMessageTo(mess.addr, mess.buff, mess.buffSize);
+        }
+
+        void recycleBuffToUdpServer(const UdpServer::Message& mess)
+        {
+            if(mess.buffSize+_curUdpBuffIndex >= _udpServer->prelocatedBuffBlockSize)
+            {
+                //TODO:错误处理
+                _udpServer->returnBuff(mess.buff);
+                _curUdpBuffIndex = 0;
+            }
+            else
+            {
+                _curUdpBuffIndex += mess.buffSize;
+            }
         }
 
         struct SockAddrComp
@@ -157,7 +201,7 @@ namespace cf
 
         struct Session
         {
-            Session(int32_t id, const sockaddr_in &addr) :
+            Session(uint32_t id, const sockaddr_in &addr) :
                     sessionID(id),
                     sockAddr(addr),
                     kcp(nullptr) {}
@@ -168,16 +212,20 @@ namespace cf
                     ikcp_release(kcp);
             }
 
-            int32_t sessionID;
+            uint32_t sessionID;
             sockaddr_in sockAddr;
             ikcpcb *kcp;
         };
 
+        const static uint32_t MagicNum = 100319;
         const static int32_t BuffSize = 1024 * 64;
+
         bool _started;
-        int32_t _curSessionSeq;
+        bool _running;
+        uint32_t _curSessionSeq;
         char _buff[BuffSize];
 
+        std::thread _udpThread;
         int32_t _curUdpBuffIndex;
         UdpServer *_udpServer;
         std::map<struct sockaddr_in, Session *, SockAddrComp> _addrSessionMap;
